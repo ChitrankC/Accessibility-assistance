@@ -103,6 +103,11 @@ JARVIS_WELCOME_PHRASE = (
 JARVIS_AFTER_SONG_DELAY_S = 1.0
 # Save ElevenLabs PCM as WAV under .cache/jarvis_welcome/; replay skips the API when the key matches.
 JARVIS_WELCOME_CACHE_ENABLED = True
+# If True, the double-clap automation sequence runs only once per script process.
+# If False, double claps trigger actions every time (debounced by COOLDOWN_S & speech execution lock).
+SINGLE_RUN_ONLY = True
+
+is_executing_actions = False
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -325,13 +330,23 @@ def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
         raise
 
 
+def _say_text_fallback(text: str) -> None:
+    if sys.platform == "darwin":
+        log.info("Using macOS native TTS ('say' command) fallback.")
+        try:
+            subprocess.run(["say", text])
+        except Exception as e:
+            log.warning("macOS TTS fallback failed: %s", e)
+
+
 def say_jarvis_welcome() -> None:
     if not JARVIS_WELCOME_ENABLED or not JARVIS_WELCOME_PHRASE.strip():
         return
     text = JARVIS_WELCOME_PHRASE.strip()
     vid, model_id, output_format, pcm_rate = elevenlabs_env_config()
     if not vid:
-        log.warning("Set ELEVENLABS_VOICE_ID in the environment for ElevenLabs TTS.")
+        log.warning("ElevenLabs Voice ID missing; falling back to macOS TTS.")
+        _say_text_fallback(text)
         return
 
     cache_path = _jarvis_welcome_cache_path(text, vid, model_id, output_format)
@@ -343,12 +358,14 @@ def say_jarvis_welcome() -> None:
 
     api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
     if not api_key:
-        log.warning("Set ELEVENLABS_API_KEY in the environment for ElevenLabs TTS.")
+        log.warning("ElevenLabs API Key missing; falling back to macOS TTS.")
+        _say_text_fallback(text)
         return
     try:
         from elevenlabs.client import ElevenLabs
     except ImportError:
-        log.warning("Install dependencies: pip install -r requirements.txt")
+        log.warning("ElevenLabs dependency missing; falling back to macOS TTS.")
+        _say_text_fallback(text)
         return
     try:
         client = ElevenLabs(api_key=api_key)
@@ -360,10 +377,12 @@ def say_jarvis_welcome() -> None:
         )
         raw = b"".join(chunks)
     except Exception as e:
-        log.warning("ElevenLabs TTS failed: %s", e)
+        log.warning("ElevenLabs TTS failed: %s; falling back to macOS TTS.", e)
+        _say_text_fallback(text)
         return
     if not raw:
-        log.warning("ElevenLabs returned empty audio.")
+        log.warning("ElevenLabs returned empty audio; falling back to macOS TTS.")
+        _say_text_fallback(text)
         return
     if JARVIS_WELCOME_CACHE_ENABLED:
         try:
@@ -377,16 +396,29 @@ def say_jarvis_welcome() -> None:
         sd.play(pcm_f, pcm_rate)
         sd.wait()
     except Exception as e:
-        log.warning("Could not play ElevenLabs audio: %s", e)
+        log.warning("Could not play ElevenLabs audio: %s; falling back to macOS TTS.", e)
+        _say_text_fallback(text)
 
 
 def play_song(uri: str) -> None:
     u = uri.strip()
     if not u:
         return
+    # Convert web Spotify link to native spotify: URI so Spotify Desktop App handles it directly
+    if "open.spotify.com/track/" in u:
+        track_id = u.split("open.spotify.com/track/")[1].split("?")[0]
+        u = f"spotify:track:{track_id}"
+
     try:
         if sys.platform == "win32":
             os.startfile(u)
+        elif sys.platform == "darwin":
+            subprocess.Popen(
+                ["open", u],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         else:
             webbrowser.open(u)
     except OSError as e:
@@ -405,6 +437,10 @@ def _chrome_executable() -> str | None:
             p = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
             if os.path.isfile(p):
                 return p
+    elif sys.platform == "darwin":
+        mac_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.isfile(mac_path):
+            return mac_path
     return shutil.which("google-chrome") or shutil.which("chrome")
 
 
@@ -763,6 +799,10 @@ def _cursor_executable() -> str | None:
                 p = os.path.join(local, *sub.split("\\"))
                 if os.path.isfile(p):
                     return p
+    elif sys.platform == "darwin":
+        mac_path = "/Applications/Cursor.app/Contents/MacOS/Cursor"
+        if os.path.isfile(mac_path):
+            return mac_path
     return shutil.which("cursor")
 
 
@@ -864,20 +904,38 @@ def _focus_existing_cursor_window_win32() -> bool:
 
 def run_double_clap_actions() -> None:
     """Run outside the mic loop so sleeps do not stall capture."""
-    play_song(SONG_URI)
-    open_claude_in_chrome()
-    open_binance_btc_in_chrome()
-    if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
-        delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
-        if delay:
-            time.sleep(delay)
-        threading.Thread(target=say_jarvis_welcome, daemon=True).start()
-    open_cursor_window()
+    global is_executing_actions
+    is_executing_actions = True
+    try:
+        play_song(SONG_URI)
+        open_claude_in_chrome()
+        open_binance_btc_in_chrome()
+        open_cursor_window()
+        if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
+            delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
+            if delay:
+                time.sleep(delay)
+            say_jarvis_welcome()
+    finally:
+        time.sleep(2.0)
+        is_executing_actions = False
 
 
 def open_cursor_window() -> None:
     if not FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP and not OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
         return
+    if sys.platform == "darwin":
+        try:
+            subprocess.Popen(
+                ["open", "-a", "Cursor"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except OSError as e:
+            log.warning("Could not open Cursor on macOS: %s", e)
+            return
     exe = _cursor_executable()
     if not exe:
         log.warning(
@@ -986,6 +1044,8 @@ def main() -> int:
         ) as stream:
             while True:
                 data, overflowed = stream.read(blocksize)
+                if is_executing_actions:
+                    continue
                 if overflowed:
                     log.warning("Input overflow; try a larger BLOCK_MS")
 
@@ -1020,11 +1080,11 @@ def main() -> int:
                         elif gap <= MAX_DOUBLE_GAP_S:
                             first_clap_time = None
                             last_logged_double = now
-                            if not welcome_sequence_done:
+                            if not welcome_sequence_done or not SINGLE_RUN_ONLY:
                                 welcome_sequence_done = True
                                 log.info(
                                     "Double clap detected (gap=%.3fs, rms=%.5f, "
-                                    "noise_floor=%.5f, threshold=%.5f) — running welcome once",
+                                    "noise_floor=%.5f, threshold=%.5f) — running welcome actions",
                                     gap,
                                     level,
                                     noise_floor,
